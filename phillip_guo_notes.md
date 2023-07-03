@@ -59,7 +59,7 @@ in an interactive session.
 
 Again, you can compile example code with:
 ```
-c = compile('guo_notes/lecture_02_a.py', 'test.py', 'exec')
+c = compile(open('guo_code/lecture_02_a.py', 'r').read(), 'test.py', 'exec')
 ```
 Sadly I'm not yet sure how to make ipython (or an alternative) work
 with a from-source compile, but you can poke at this with either
@@ -114,6 +114,7 @@ Where to find code:
   actually runnable...
   - Instead, you have to look at `generated_cases.c.h`, which gets
     included into `ceval.c`s `_PyEval_EvalFrameDefault`.
+- All the macros have been extracted into `ceval_macros.h`
 
 The opcode handlers are mostly not too hard to skim, but some of the
 switch logic is very confusing, there are macros that do things like
@@ -162,17 +163,246 @@ Logic, at a *very* high level
 - You can see what the code does in a simpler way if you avoid
   `USE_COMPUTED_GOTOS`.
 
-### A few things I learned from poking around while watching lecture 2
-
-I think varargs / splatted keyword args may be handled by something other
-than the `co_.*` fields of code objects, because as far as I could tell
-there was no field that would tell you how to handle that.
+### Some more miscellaneous things I noticed
 
 Top-level code doesn't use locals - the names have to be in the globals
 table, and as a result top-levels won't make much use of `LOAD_FAST`; they'll
 use `LOAD_NAME` instead.
 
-I'm not really sure why, but top-levels also don't seem to make much use
-of `co_consts`. This is a bit of a mystery to me at this point.
+Much as in `clox`, the code object for closures that might be created become
+constants in functions - including top-level functions.
+
+It also appears to me (based on dis for `lecture_02_b.py`) that default args
+get turned into a tuple by the compiler when constructing a function from
+code and from data defined in the calling context.
+
+Specifically, I'm looking at this snippet:
+```
+  1           2 LOAD_CONST               3 ((5,))
+              4 LOAD_CONST               1 (<code object f at 0x104f37ad0, file "guo_code/lecture_02_b.py", line 1>)
+              6 MAKE_FUNCTION
+```
 
 
+## Notes from Lecture 3
+
+(Lecture at https://www.youtube.com/watch?v=dJD9mLPCkuc&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=3)
+
+### What about this lecture is out of date?
+
+- The code locations have changed, as discussed above
+- The `EvalFrameDefault` code no longer evaluates a frame, today it loops
+  and evaluates all frames in one python green thread. As a result a number of
+  things are no longer true:
+  - It no longer returns an object in most cases; the only actual returns
+    these days are in 2 spots related to hard exit / uncaught errors:
+	- in the top-frame case of exception handling at `exit_unwind`
+	- in the INTERPRETER_EXIT opcode
+  - It no longer sets locals from the frame at initialization, instead
+    it has to do that via a macro at certain labels (in particular when resuming)
+- The `DISPATCH` macro and friends have replaced the older next-opcode logic
+
+### Python Tutor
+
+You can paste code into https://pythontutor.com/render.html to trace
+execution.
+
+In additon to the example code from the class, I also thought it was
+cool to try a generator and see how it gets displayed:
+```py
+x = 10
+
+def example_iter():
+    for x in range(2):
+        yield x
+        
+        
+def bar():
+    for x in example_iter():
+        print(x)
+        
+        
+Unfortunately it wasn't quite as obvious from the visualization what the
+runtime representation actually is for generators, but Lecture 9 will at least
+partially cover this.
+
+
+### A quick skim of the core `_PyEval_EvalFrameDefault` function
+
+Looking at `ceval.c`s `_PyEval_EvalFrameDefault` in greater detail (ignoring the
+many lines of error handling).
+
+The name is a little misleading; it doesn't just evaluate one stack frame, because
+its implementation is sort of tail recursive (where intermediate data is pushed
+onto the heap).
+
+It runs an infinite loop over opcodes, where:
+- if we need to call another function, we'll set up the frame in-place and then
+  `goto start_frame`, generally via a call to `DISPATCH_INLINED`
+- if we hit an exit condition like `return`, we'll clean up the current frame and
+  then `goto resume_frame`.
+
+Some of the relevant variables here:
+- `opcode` and `optarg` are the currently-being-processed code and argument
+- `PyObject **stack_pointer` is a cached value of the frame's datastack, and it
+  points to the next *available* slot on the stack (so the top of the stack is
+  at `-1`
+
+Key labels:
+- All `start_frame` really does is check for stack overflow via `_Py_EnterRecursivePy`.
+  Then control flow passes beyond `resume_frame`.
+- `resume_frame` only does a couple things:
+  - set the `stack_pointer` as `_PyFrame_GetStackPointer`
+  - set `next_instr = frame->prev_instr + 1`
+  - call `DISPATCH()`, which jumps to the next instruction
+- `handle_eval_breaker`, which is a label we occasionally jump to from handling opcodes
+  in oder to handle all cooperative concurrency features as well as some internal
+  things like GC. All it really does is
+  - call `_Py_HandlePending`
+  - return to the eval loop via `DISPATCH`
+- The actual raw eval loop (which is only a true "loop" if `!USE_COMPUTED_GOTOS`)
+  lives underneath `handle_eval_breaker`. It is labeled as `dispatch_opcode` in the
+  case where we aren't using computed gotos.
+  - It is mostly just the contents of `generated_cases.c.h`, which is generated
+    from `bytecodes.c`. But there's a tiny bit of fall-through logic inlined directly
+	here for
+    - instrumented lines (I'm unsure what this is, likely related to some combination
+	  of tracing, debugging, or profiling). It invokes `_Py_call_instrumentation_line`
+	  on the current frame which seems like what a debugger would want.
+	- unknown opcodes, which always creates an error
+- Various `error` and `exception` related labels
+  - unbound locals and pop failures have special-cased error handlers with extra logic
+  - all of the error handlers eventually jump or fall through to `error`, which does some
+    frame handling and calls `monitor_raise`
+  - after `error` we fall through to the `exception_unwind` label, which I believe
+    handles the actual logic of bubbling up exceptions.
+	- It winds up calling `get_exception_handler`, which is presumably where catch happens
+	- I *think* this logic is all at a per-block level rather than per-frame
+  - after `exception_unwind` we fall through to `exit_unwind`, which I think is when we've
+    given up on the current frame and bubble the exception up to the parent
+    when we've exited all blocks.
+	- it also handles the possibility that we're at the very top-level frame in which
+	  case we actually `return NULL`
+  - finally, if we have more frames it will fall through to `resume_with_error` which
+    calls `SET_LOCALS_FROM_FRAME` to reset frame-specific ceval variables and then jumps
+	right back to `exit`; this is how unwinding happens!
+
+... Note: the labels I just went through cover *all* of the `_PyEval_EvalFrameDefault`
+logic other than initialization; the bracket after `resume_with_error` is the end of that
+function.
+ 
+ 
+### Diving into C code for some code-related objects
+
+**`PyCodeObject`**
+
+Defined in `code.h`
+
+The `_PyCode_DEF` macro defines a code object. This gets bound to the
+`PyCodeObject` type, which is a subtype of `PyObject` and is the
+C-level representation of the compiled bytecode objects that we see
+when we look at `__code__` in the interpreter.
+
+Not everything here is obvious; there's executor and cache related
+code I don't yet understand, and some stuff that may be related to
+`.pyc` file versioning.  But most of the data corresponds in obvious
+ways to the exposed Python apis.
+
+The raw bytecode is inside the code as co_code_adaptive
+
+**`_PyCFame`**
+
+This is the C representation of the fame stack; it contains the extra
+linked-list boilerplate to wrap a `_PyInterpreterFrame` and a pointer
+to the previous `_PyCFrame`. It does not have Python bindings.
+
+**`PyInterPreterFrame`**
+
+Defined in `pycore_frame.h`.
+
+This value, which is a `PyObject` subtype, contains:
+- The code object at `f_executable`
+- The previous stack frame `*previous`... I'm not sure yet why
+  we needed `_PyCFrame` or whether the previous frames are actually
+  the same in both these views.
+- Pointers to the environment lookups (globals, builtins, locals)
+  at `f_{whatever}`
+- The stack pointer for the data stack.
+- The instruction pointer, and a `return_offset` pointer used
+  in some cases to get the instruction pointer right when resuming after
+  a return or yield.
+- An alternate representation of the frame, in a `PyFrameObject*
+  *frame_obj` field
+
+**`PyFrameObject`**
+
+Also defined in `pycore_frame`
+
+This is yet another representation of the frame stack. I need to read
+`Objects/frame_layout.md` to really understand why we have all these different
+representations!
+
+It contains:
+- another frame pointer `f_back`
+- a pointer to the fame data as a `_PyInterpreterFame* f_frame` (I think
+  they each point to one another.
+- Line number data, and some stuff related to fast locals / tracing
+- A `PyObject *_f_frame_data[1]` array of objects; not yet sure what this is.
+
+
+### Function calling
+
+The opcode for calling a function these days is `CALL_FUNCTION_EX` rather
+than `CALL_FUNCTION`. What does this do?
+
+- It puts the args into a tuple if they weren't already
+- It has special cases for instrumented calls which we can probably ignore for now
+- In the vanilla case, the function is a `PyFunction_Type`, then we'll create a new
+  frame and call `DISPATCH_INLINED`, which winds up:
+  - initializing the new frame and pushing it onto the stack, with much of the work
+    (including copying locals) actually implemented in
+	`_PyEvalFramePushAndInit_Ex` (which in turn relies on `_PyEvalFramePushAndInit`
+  - calling `goto start_frame` to resume the loop in the new frame
+- There's a fall-through to *calling* the `PyObjectCall` function, which
+  - Winds up handling errors on non-callable functions
+  - Otherwise, winds up executing a C-level function pointer associated with
+    `Py_TYPE(callable)->tp_call`, effectively the `__call__` method (at the C-API
+	level) for this object.
+	- This could execute native code (e.g. a PyObject representing a wrapped C func)
+	- Or it might wind up executing a normal `__call__` method in Python; in this
+	  case I *think* we're going to wind up in a new C-level stack frame of
+	  `_PyEval_EvalFrameDefault` (in other words we do recurse on callable object
+	  calls, just not on "vanilla" function calls).
+	  
+	  
+There are a lot of details around making sure everything gets cleaned up
+correctly on return. I'm not ready to dive into that yet.
+
+### A note from Phillip's bit about the stack of conceptual things
+
+Bytecode is raw bytecode.
+
+A Code object combines bytecode with extra semantic info, especially names
+and constant values.
+
+A function wraps a code object with environment information, such as builtins,
+globals, and possibly closed-over data.
+
+
+A frame combines a function with dynamic data from a single execution, in
+particular locals / data stack / instruction pointer info.
+
+
+### Miscellaneous notes on some actual opcode evaluation
+
+You'll note that we have to increment / decrement refcounts whenever we push / pop from
+the stack; the refcount needs to include the value stack as a valid reference.
+
+What does a function object actually have? It has access to all kinds of environment data.
+In the case of a static function, this will include things like `f.__builtins__` which is
+a dict of the built-in names and `f.__globals__` which is the global environment for `f`
+(which in practice is probably the environment of the module `f` was defined in).
+
+If the function actually closes over anything it will also have a tuple of "cells" at
+`f.__closure__` (`__closure__` is `None` for top-level static functions). Each entry will be
+a `cell` type with the closed-over value as `cell_contents` in the Python API.
