@@ -1,0 +1,8 @@
+# Anything not in my initial vendoring of CPython should be ignored
+cpython/*
+
+# Ignore all compile artifacts
+*.a
+*.so
+*.o
+*.exe
