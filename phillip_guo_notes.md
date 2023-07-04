@@ -148,7 +148,7 @@ Inputs
         one for any arg (opcodes that need more than one byte for the arg can
         extend it using EXTENDED_ARG, a dedicated opcode, to add up to 3 extra
         bytes)
-    - f_funcobj, f_global, f_builtins, f_locals; all of these are runtime
+    - `f_funcobj`, `f_global`, `f_builtins`, `f_locals`; all of these are runtime
       data you could potentially introspect. Many of them appear to be
       only valid some of the time from the standpoint of C code.
     - `PyObject* localsplus[1]`; the `[1]` here probably a lie, I *think* this
@@ -606,9 +606,20 @@ types including float, long, and unicode.
 The concatenation implementation lives at `bytes_concat`, and it becomes part of the
 `bytes_as_sequence` code.
 
+How it works abstractly:
+
 Note that this means the eval loop has to handle falling back to `sq_concat` if the
 `BINARY_OP1` lookup in the implementation of`PyNumber_Add` lookup fails. That's exactly
-what you'll see if you look at the `PyNumber_Add` implementation in `abstract.c`!
+what you'll see if you look at the `PyNumber_Add` implementation in `abstract.c`! I believe
+this is what happens if you try to concat `bytes` with `+`.
+
+How it actually works, for `str`:
+
+The "hot" cases are once again improved by specialization; if you look at 
+`_Py_Specialize_BinaryOp` in `specialize.c` you'll see that it actually handles
+`str` (but not `bytes`) concatenation in a hardcoded hook that dispatches
+to `BINARY_OP_ADD_UNICODE`). As far as I can tell `bytes` aren't specialized though,
+so I think they go through the normal fallback logic in `abstract.c`.
 
 
 ### Note: what's going on with all the `clinic` and `Include/cpython` stuff?
@@ -628,5 +639,186 @@ It makes the code harder to skim at first but if you know what to expect it's no
 
 Some of what's going on is explained in
 `Doc/howto/clinic.rst`.
+
+
+## Lecture 6: Code Objects, Functions, Closures
+
+
+See https://www.youtube.com/watch?v=ix6MTSemdUU&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=6
+
+
+This lecture can be viewed as primarily about the "lifetime" of functions
+and related data.
+
+### Code objects, created at compile time
+
+A code object is created when we compile a module; it becomes part of the module
+constants. But no function object exists yet.
+
+Recall that code objects are defined by `PyCodeObject` in `code.h` and know the
+static information needed to run a function, but do not include environment data.
+
+We already discussed this in some detail above so I won't repeat too much here.
+
+### Function objects, created at declaration time
+
+A function is actually created by a `def` form.
+
+The resulting data doesn't look the same as it used to when this lecture was given;
+the various `func_.*` attributes from that lecture are now dunder attributes:
+- `f.__globals__` is a pointer to the global environment (module-level where the
+  func was defined)
+- `f.__builtins__` is similar, but builtins aren't in globals so they
+  need a separate lookup.
+- `f.__defaults__` stores the default arguments for the function
+- `f.__closure__` has handles on nonlocals (closed-over values), each of which
+  is a `cell` class whose `cell_contents` points at the actual data. This attribute
+  will be `None` for static functions.
+- `f.__code__` is of course the code object, with all the static information.
+- `f.__annotations__` has the type annotations, as a dict.
+- `f.__module__` has the name of the parent module
+- `f.__type_params__` has PEP 695-style type annotations as a tuple; each entry
+  will be a `typing.TypeVar`.
+- `f.__doc__` has a docstring, if any
+  
+  
+### Closures
+
+All function objects are structured "like" a closure, they have a handle
+on their environment.
+
+There are three things that are really specific to closures, by which I mean
+functions that actually escape their defining scope:
+- In the code object of the *creator*, `__code__.co_cellvars` will indicate
+  which locals escape into a nested function. (Note that it's possible for multiple
+  layers of indirection to be needed if there are many layers of function nesting).
+  - This is likely needed for lifetime management in some cases; for example in
+    `clox` (which has a different, lua-based impl) the outer function has to know
+	when to move data to a "cell" after a local disappears from the call stack.
+- In the code object of the *closure*, `__code__.co_freevars` will indicate the
+  names of all captured variables. Each one should show up in `co_cellvars` of the
+  parent.
+- In the closure object (the function), the `__closure__` attribute will be
+  a tuple with the actual `cell`s with handles on captures, rather than
+  `None` as in a static function.
+
+
+I'm pretty sure that the closure cell's C representation is `PyCellObject`,
+as defined in
+- `Include/cpython/cellobject.h`... all it really is is a pointer to the
+  actual object.
+- `Objects/cellobjects.c` where the logic lives. There's not much
+  here besides getting contents, minimal things like repr/compare, and
+  managing the refcounts.
+  
+Actually because it's so minimal, the `PyCellObject` code is a kind of nice
+way to get a micro-intro to the `PyTypeObject` API.
+
+### The C representation of Functions / Closures
+
+The function type is defined in
+- `Include/cpython/funcobject.h` which has the actual `PyFuncObject` type,
+  public function headers, and the declaration but not definition of
+  `PyFunction_Type`.
+- `funcobject.c` which implements all the helpers and has the actual
+  `PyTypeObject` declarations.
+  
+The code is a little more complex than we want to cover end-to-end
+right now because it includes specialized `PyTypeObject`s for class
+methods and static methods, but if you focus just the base function
+type and object structs you can see what we care about.
+
+`PyFunctionObject` has attributes that correspond to all the dunder methods,
+although their names match the old Python2 code:
+- `func_doc`, `func_dict`, `func_typeparams`, `func_module`
+  `func_annotations`, `func_closure` are all pretty obvious
+- I'm not sure what `func_weakreflist` is yet, I need to read more about
+  weak references (added this to my to-do notes!).
+- There's some other stuff that's more advanced than worth covering here;
+  `func_version` can be used by the specialization framework and
+  `vectorcall` presumably allows some form of vectorization optimization;
+  I'm not sure where it's used but you can check out the signature in
+  `object.h`.
+  - Both of these didn't exist when the lecture was given.
+  
+The `PyFunction_Type` implementation isn't actually all that interesting,
+other than it's `call` appears to be focused on vector calls only; I'm
+not really sure how this works yet (normal calls are special-cased in
+the interpreter so you presumably wouldn't hit the `tp_call` anyway).
+
+I made a note in my looming questions doc that this would be good to
+investigate more someday.
+
+**The old `function_call` function vs new logic + vectorcall**
+
+In the lecture, Guo talks about how the `tp_call` function points to
+`function_call`, which allocates a new frame and calls the pyeval loop.
+
+This is no longer true; as I discuss below these days the loop crosses
+function calls, so the frame is allocated in the same loop and we just
+jump to `start_frame` label.
+
+As a result, the `tp_call` is now repurposed to vectorcall, which I
+don't know anything about yet.
+
+**garbage collection**
+
+Some day I do need to understand the GC code. I realize that a lot
+of CPython is really about refcount handling and that the code looks
+"almost" like using smart pointers.
+
+But what confuses me is that it's not obvious how CPython knows how
+to navigate all the pointers when doing cycle detection; in `clox`
+the key thing 
+
+### Creating functions
+
+The bytecode operation to build a function is `MAKE_FUNCTION`, which
+constructs a `PyFunctionObject` via `PyFunction_New(codeobj, GLOBALS())`.
+Most of the logic is actually in `PyFunction_NewWithQualName`:
+- increment the reference on globals
+- grab the `__name__` out of globals ot use for `__module__`
+- grab `builtins` from `globals` and `tstate`
+  - note the ugly popping-out-of-nowhere of `tstate` via `_PyThreadState_GET()`
+- Make a new struct `op` via `PyObject_GC_New` (I find this name weird
+  since `op` sounds like `opcode` but I think it means "object
+  pointer")
+- save globals and builtins in the func object, along with some other
+  things
+
+
+### Frames
+
+This lecture didn't really discuss frames, but I want to back bounce to
+Lecture 3 again: recall that a frame includes pointers `f_funcobj` for the
+function object and also a handful of pointers like `f_globals` that seem
+to be duplicated with functions.
+
+You can see how this works by looking at one of the `CALL` opcodes. When
+we make a call, we will
+- verify that the thing we call is a normal function with `PyFunction_Check`
+- get the function, and then pass it to a frame constructor:
+  `_PyInterpreterFrame *new_frame = _PyFrame_PushUnchecked(tstate, func, argcount)`
+
+This function (defined in `pycore_frame.sh`) will in turn do a bit of
+lowlevel datastack work and then call `_PyFrame_Initialize`, which will
+copy most of the function data pointers into the frame.
+
+Note that the fields borrowed from func are all commented as
+"Borrowed reference. Only valid if not on C stack". I'm not actually
+certain what this means in practice (I'm assuming it means the frame being
+a stack-allocated C value, but that doesn't really clear it up for
+me), but it's worth noting that we *don't* increase refcounts for the frame
+so I think we could get dangling pointers if a frame were able to outlive its
+function.
+
+The locals are always initialized to `NULL`; populating them is inlined
+into the eval loop code rather than during the initialization functions.
+
+
+### Random note: `__dict__` is implemented as `PyMemberDef`
+
+This was in answer to a student's question. I should eventually write
+more detailed notes on how `__dict__` / `dir()` work.
 
 
