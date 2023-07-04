@@ -822,3 +822,183 @@ This was in answer to a student's question. I should eventually write
 more detailed notes on how `__dict__` / `dir()` work.
 
 
+# Lecture 7: Iterators and looping
+
+See https://www.youtube.com/watch?v=8-KfIsDbxVY&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=7
+
+
+The iterator API is defined at two layers, in C and in Python.
+
+In C, the iterator API basically consists of:
+- a `tp_iter` that might return an iterator object for a given object. The iterator
+  *can* be yourself, but in many cases it's something else (for example tuples and
+  bytes each have separate iterator types).
+- a `tp_iternext` that an iterator type should implement. This should either produce
+  a `PyObject*` or "throw" an exception at the C API level.
+  
+The Python API is similar:
+- you can have an `__iter__` method (invokable with `iter(obj)`) that produces an
+  iterator; you could just return `self` if the type is already an iterator, or
+  you could use a generator with `yield`, or you could return some other object.
+- an iterator object should implement `__next__` (invokable with `next(obj)` to
+  get the next item, or raise a `StopIteration` when done
+  
+  
+### Let's look a bit at the list type
+
+Lists are defined in:
+- `Include/listobject.h` which declares list functions and the list type objects
+  `PyList_Type`, `PyListIter_Type`, and `PyListRevIter_Type`.
+- `Include/cpython/listobject.h` which defines the actual `PyListObject`; the
+   underlying representation is just
+   - `PyObject_VAR_HEAD` (refcount, type, and the size)
+   - `PyObject **ob_item` (the actual contents)
+   - `Py_ssize_t allocated` to account for the fact that this is a "vector" type,
+     a dynamically-resizable array.
+- `Objects/listobject.c` which has all the implementations plus the definition of
+  the type objects.
+- The actual raw data type for `_PyListIterObject` is in a different module,
+  `pycore_list.h`.
+  
+  
+The heart of the list itself is really the `list_resize` operator, which
+works pretty similarly to, e.g., the resizeable arrays in `clox`.
+
+The `BUILD_LIST` bytecode could be interesting to look at eventually if you
+want to understand how lists are actually created at runtime via literals.
+
+If we look at the `PyTypeObject PyList_Type { ... }` block, we'll see that it
+defines `tp_iter` to be `list_iter`. If we actually look at this, we see that
+it creates a `PyListIterObject` of `PyListIter_Type` type.
+
+If we look at the actual `PyListIter_Type`, we'll see that it has a `tp_iter` of
+`PyObject_SelfIter`, which is the C-API helper for an iterator being iterable,
+and a `tp_iternext` of `listiter_next`. And the underlying data (defined in
+`pycore_list.h`) is pretty much what you'd expect: a pointer to the
+underlying list plus a `Py_ssize_t it_index`. The wrapper is really just needed
+so that the iterator index (which is per-iterator state) can be separated
+from the underlying list.
+
+The `listiter_next` function then implements the next in terms of that data;
+pretty much just call getitem (by way of the C level `PyList_GET_ITEM`) if
+possible and otherwise return NULL (which I'm guessing the runtime code then
+turns into a StopIteration).
+
+
+There's also a `list__reversed__impl` that produces the `PyListRevIter_Type`. I
+don't think this is so critical to dig into right now.
+
+
+### Okay, what does the bytecode that uses these APIs look like?
+
+Consider this code:
+```py
+x = ['a', 'b', 'c']
+
+for e in x:
+    pass
+```
+
+This will compile into the following bytecode:
+```
+  0           0 RESUME                   0
+
+  1           2 BUILD_LIST               0
+              4 LOAD_CONST               0 (('a', 'b', 'c'))
+              6 LIST_EXTEND              1
+              8 STORE_NAME               0 (x)
+
+  3          10 LOAD_NAME                0 (x)
+             12 GET_ITER
+        >>   14 FOR_ITER                 3 (to 24)
+             18 STORE_NAME               1 (e)
+
+  4          20 JUMP_BACKWARD            5 (to 14)
+
+  3     >>   24 END_FOR
+             26 RETURN_CONST             1 (None)
+```
+
+The interesting parts of this are:
+- `LOAD_NAME 0 (x)` pushes the list `x` onto the stack
+- `GET_ITER` grabs the iterator for `x`
+- `FOR_ITER` creates a code block (we haven't seen this yet)
+  that runs until `END_FOR`
+  - Every time we hit `FOR_ITER`, we'll put the output of `iternext`
+    onto the top of the stack.
+  - The intermediate code runs repeatedly until we hit a `StopIteration`...
+  - ...We `STORE_NAME` the top of the stack into `e`; that's all because of `pass`
+  - We then `JUMP_BACKWARD`; this line won't be hit after a stop iteration
+- After the `END_FOR` we are done (return `None`)
+
+
+### How does the bytecode evaluator work?
+
+**GET_ITER**
+
+This pretty much just calls `PYOBJECT_GETITER` and sets it to `PyObject_GetIter`.
+
+The code in `bytecodes.c` is a little wierd because of code generation, but if
+you look at `generated_cases.c.h` you can see that the declarations and stack
+push are generated.
+
+The underlying `PyObject_GetIer` code lives in `abstract.c`, and it tries to
+call `tp_iter` if possible, falling back to a "sequence iterator" if possible.
+
+The seq iterator logic (which isn't used for lists) is defined in
+`iterobject.c` which has a generic, non-specialized iterator for
+sequence types (user-space classes that implement `__seq__` will get this
+for free).
+
+The code for the generic sequence version is more interesting than the list
+version because, even though it's more or less the same, it doesn't have
+a size to use so it has to "catch" (in C code) `IndexError` or `StopIteration`
+coming from the underlying sequence and return `NULL`.
+
+**FOR_ITER**
+
+Once again there's a lot of generated code so it's good to cross-reference
+`bytecodes.c` with `generated_cases.c.h`.
+
+Ignoring specialization, what this does is kind of what' you'd expect:
+- Peek at the top of the stack to set `iter` (don't pop it!)
+- Try calling `tp_iternext` on it
+- Handle various error conditions
+  - In particular, if `tstate` indicates a `PyExc_StopIteration` then
+    handle it as if no error.
+  - Note: the built-in iterators don't actually use `StopIteration`, they
+    just return NULL. The `StopIteration` check is only there because
+	Python-defined iterators need it, but there's overhead we wouldn't
+	want to pay on builtins.
+- Depending on whether we found a value:
+  - If yes, put it on the stack (`STACK_GROW(1); stack_pointer[-1] - next`)
+  - If no, then finish...
+    - `STACK_SHRINK(1)` and `Py_DECREF(iter)` cleans up the stack
+	- Some inline cache stuff I don't understand yet
+	- `JUMPBY(oparg + 1); DISPATCH()` exits the loop
+
+**JUMP_BACKWARD**
+
+This is pretty much what you'd expect, it mainly just calls
+`JUMPBY(1 - oparg)`. There are two extra goodies though:
+- Some specialization hooks; I guess specialization is looping-aware(?)
+- A call to `CHECK_EVAL_BREAKER` which means we're creating an opportunity
+  for the GC to run, or to switch to another green thread.
+
+### Misc notes
+
+There used to be an extra has-iterator check and list was special
+cased more. That logic no longer exists, lists will actually have their
+iterator accessed by way of `tp_iter`.
+
+The flags do still exist in `object.h` and involve bit-shifted `1UL` values,
+for example `Py_TPFLAGS_TYPE_SUBCLASS`.
+- You still set flags by bitwise-oring them,
+  e.g. `Py_TPFLAGS_TYPE_SUBCLASS | Py_TPFLAGS_BYTES_SUBCLASS`.
+- And you still access flags by bitwise-anding the flags with the flag
+  you want, e.g. `long is_bytes = flags | Py_TPFLAGS_BYTES_SUBCLASS`
+
+
+We'll see the bridge between user-defined classes with `__seq__`,
+`__iter__`, and/or `__next__` and the `tp_iter` / `tp_iternext` C
+APIs soon when we cover user-defined classes.
