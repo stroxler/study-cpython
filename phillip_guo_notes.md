@@ -601,6 +601,15 @@ It's not a terrible idea to then go up and also check the specialization code in
 `_Py_Specialize_CompareOp`, which special-cases same-type comparisons on a few built-in
 types including float, long, and unicode.
 
+**Concatenation**
+
+The concatenation implementation lives at `bytes_concat`, and it becomes part of the
+`bytes_as_sequence` code.
+
+Note that this means the eval loop has to handle falling back to `sq_concat` if the
+`BINARY_OP1` lookup in the implementation of`PyNumber_Add` lookup fails. That's exactly
+what you'll see if you look at the `PyNumber_Add` implementation in `abstract.c`!
+
 
 ### Note: what's going on with all the `clinic` and `Include/cpython` stuff?
 
