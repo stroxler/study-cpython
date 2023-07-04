@@ -220,6 +220,7 @@ def example_iter():
 def bar():
     for x in example_iter():
         print(x)
+```
         
         
 Unfortunately it wasn't quite as obvious from the visualization what the
@@ -406,3 +407,217 @@ a dict of the built-in names and `f.__globals__` which is the global environment
 If the function actually closes over anything it will also have a tuple of "cells" at
 `f.__closure__` (`__closure__` is `None` for top-level static functions). Each entry will be
 a `cell` type with the closed-over value as `cell_contents` in the Python API.
+
+
+## Notes on Lecture 4 (the PyObject data model)
+
+See https://www.youtube.com/watch?v=naZTXNBbcLc&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=4.
+
+
+### What has changed since the lecture?
+
+There is no `intobject.c` anymore, nor a `PyIntObject` type. I'm not yet sure where that code
+migrated to.
+
+Instead, look for `PyLongObject` and `longobject.c`. The actual `add` operation is fairly complex
+because longs are arbitrary-size integers; there are hacks to avoid this on smaller integers but
+I don't know the interpreter well enough to find that code yet. It's also trickier to find the
+actual definition of the struct for `PyLongObject` because it's been moved into
+`longintrepr.h` and is aliased in `pytypedefs.h`.
+
+You can read the docs on the Python-level API for `PyObject` at:
+https://docs.python.org/3/reference/datamodel.html
+
+
+### The core code for the lecture
+
+The code for this lives in
+- `Include/object.h`, which defines
+  - various macros, including the
+    - PyObjct_HEAD macro that gets inlined into child type structs + initializers
+  - The `_object` struct, which gets aliased to `PyObject` in `pytypedefs.h`
+  - Forward decorations for the *many* functions that operate on `PyObject`
+- `Include/cpython/object.h` (it's *so* weird that there are two `object.h` files!!) defines:
+  - Some basic string-related code (remember from clox that strings are very special; the
+    interpreter uses them heavily internally so they have to be hardcoded at a low level)
+  - The `_typeobject` struct, which gets aliased to `PyTypeObject` in `pytypedefs.h`
+  - In order to support ^, the various api structs to support type objects (e.g. `PyNumberMethods`,
+    `PySequenceMethods`
+- `Objects/object.c` which is where the implementations live. Some of the chunks of functions:
+  - ref incrementing / decrementing
+  - new and init functions
+  
+  
+Other code that you'll reach if you dig into this:
+- `pyport.h`, which defines macros like `PyAPI_FUNC`, `PyAPI_DATA`
+
+The actual `PyObject` structure is fairly simple, it has:
+- Optionally some `_PyObject_HEAD_EXTRA` data that allows a debug build to have
+  mark-and-swee GC to debug refcounting problems. Normally this is empty.
+- A refcount, whose implementation as split 32-bit integers I unfortunately
+  can't currently understand.
+- A `PyTypeObject * ob_type` field where all of the type-specific information lives
+
+Most implementations will put more object-specific data after the type but that is
+type-dependent, the `_object` struct itself does not mandate any data. `PyObject` itself
+is not instantiatable at all from Python (you could make one in C, but it's never used
+normally!).
+
+There's also `PyVarObject` which has the same header but includes an `ob_size`. I'm not
+yet sure what it's used for; my guess is that it allows some built-in container variable-size
+objects like `str` to have an optimized representation(?).
+
+The `PyTypeObject` type (aka `_typeobject` in `object.c`) is a subtype of `PyObject`
+
+After preprocessing, the actual definition of `PyObject` is just
+```C
+struct _object {
+	PY_UINT32_T ob_refcnt_split[2];   // refcount, in 32-bit parts
+    PyTypeObject *ob_type;            // the associated type object
+};
+```
+
+
+### Inspecting objects
+
+In the python interpreter, you can introspect a lot of the object API using `dir` and
+`__dunder__` methods / attributes.
+
+For an example of a specific `__add__` implementation, you can look at `floatobject.c.h`
+
+You can inspect refcounts with `from sys import getrefcount; getrefcount(o)`.
+  
+### Adding ints
+
+This has gotten harder to follow since the lecture was given; these days the operations
+are hardcoded into a `static const binaryfunc binary_ops[]` in `ceval.c`, and then dummied
+out in the `bytecodes.c` logic. The `BINARY_OP` opcode will dispatch on that array.
+
+The definition of `binaryfunc` is:
+```
+typedef PyObject * (*binaryfunc)(PyObject *, PyObject *);
+```
+and the `+` op becomes `PyNumber_Add`, which is declared in `abstract.h`.
+
+The actual definition is a little hard to find, but it's in `Objects/abstract.c`. It
+isn't too involved, although there's some indirection to use the function pointers
+defined in `PyNumberMethods` and to share logic with other binary ops that use a
+similar lookup mechanism.
+  
+
+## Lecture 5: The type model (focusing on sequences as an example: tuples and strings)
+
+See https://www.youtube.com/watch?v=ngkl95AMl5M&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=5
+
+### What's changed?
+
+The lecture is mostly about `stringobject` which no longer exists, so today you
+have to decide whether to look at `
+
+### The Tuple Type
+
+Two types have their `PyTypeObject`s declared in `Include/tupleobject.h`:
+- `PyTuple_Type`, the type for tuples themselves
+- `PyTupleIter_Type`, the C representation of the result of iterating a tuple
+
+There are also a handful of basic tuple-related functions.
+
+A weird thing about tupleobject is that it passes through the generated code at
+`clinic/tupleobject.c.h` and there's actually a separate `cpython/Include/tupleobject.h`
+where the actual `PyTupleObject` type is defined.
+
+All the actual magic lives in `tupleobject.c`, where the functions are defined and then
+many of them are wrapped up in the type objects. The implementations are potentially pretty
+interesting but the most important part of the module are the definitions
+```
+static PySequenceMethods tuple_as_sequence = {
+    (lenfunc)tuplelength,                       /* sq_length */
+    (binaryfunc)tupleconcat,                    /* sq_concat */
+    (ssizeargfunc)tuplerepeat,                  /* sq_repeat */
+    (ssizeargfunc)tupleitem,                    /* sq_item */
+    0,                                          /* sq_slice */
+    0,                                          /* sq_ass_item */
+    0,                                          /* sq_ass_slice */
+    (objobjproc)tuplecontains,                  /* sq_contains */
+};
+
+PyTypeObject PyTuple_Type = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    "tuple",
+    sizeof(PyTupleObject) - sizeof(PyObject *),
+    sizeof(PyObject *),
+    (destructor)tupledealloc,                   /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    ...
+    &tuple_as_sequence,                         /* tp_as_sequence */
+	...
+}
+```
+
+This really illustrates the heart of how object types are built up: special protocols
+are their own structs that types which implement them should define (other types can just
+use `0` or `NULL` there) and the sequence API is a nice example since it's smaller than,
+e.g., the number API.
+
+Then the type itself is a bunch of function pointers for the "flat" functions plus
+potentially some of these structs of protocol-specific functions.
+
+
+### The `str` type
+
+The string type lives in `unicodeobject.h` and `unicodeobject.c`. I could probably learn
+a *lot* about unicode from reading this in detail, but that's for another time. I'll
+focus on `bytes` instead for now.
+
+At somepoint I will definitely need to learn about string interning,
+which appears to happen only for unicode strings (I don't see
+interning-related logic in the `bytes` implementation).
+
+It appears to me that unicode objects are implemented in terms of a
+`PyAsciiObject` that is basically an old-school string, with some
+extra metadata in structural subtypes but I can't understand the
+relationship between PyCompactUnicodeObject and PyUnicodeObject at a
+first skim.
+
+### The `bytes` type
+
+The data types for `PyBytes_Type` and `PyBytesIter_Type` live in `Include/bytesobject.h`.
+
+The actual raw data for `PyBytesObject` lives in `Include/cpython/bytesobject.h`
+
+The private implementation is code-generated in `clinic/bytesobject.c.h`. The generated
+implementations seem to mostly wrap nicely-typed functions, most of whom have a
+`*._impl` name format, defined in `bytesobject.c`
+
+A nice function to zoom in on is `bytes_richcompare`. You can also learn a lot by tracing
+execution down from `COMPARE_OP`:
+- `inst(COMPARE_OP, ...) ...` in `bytecodes.c`
+- (ignoring adaptive code hooks) `PyObject_RichCompare` in `object.c`
+- `do_richcompare` in `object.c`
+- the `tp_richcompare` lookup inside that function
+- ... which, when comparing bytes objects, would call `bytes_richcompare`
+
+It's not a terrible idea to then go up and also check the specialization code in
+`_Py_Specialize_CompareOp`, which special-cases same-type comparisons on a few built-in
+types including float, long, and unicode.
+
+
+### Note: what's going on with all the `clinic` and `Include/cpython` stuff?
+
+The pattern of using `Include/sometypeobject.h` for type definitions but
+`Include/cpython/sometypeobject.h` for the actual data seems to be tied to
+an effort to define a `Py_LIMITED_API` compile flag that hides many implementation
+details.
+
+The second `cpython` header gets included in the normal header if that flag is *not*
+set; otherwise those headers are hidden and are only used by the generated code
+in `clinic/sometypeobject.c.h`.
+
+I can probably read up on this `Py_LIMITED_API` pattern (the rationale, patterns, etc).
+It makes the code harder to skim at first but if you know what to expect it's not
+*so* hard to navigate.
+
+Some of what's going on is explained in
+`Doc/howto/clinic.rst`.
+
+
