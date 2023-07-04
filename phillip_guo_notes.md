@@ -1211,3 +1211,225 @@ mind when skimming the C code is that the logic is still object
 oriented: if you invoke a method on an object, you don't actually need
 to pass the object becasue the method already has a handle for `self`.
 This was part of how he got confused.
+
+## Lecture 9: Generators
+
+See
+
+### An example
+
+Consider the following code:
+```py
+def generator():
+    yield 'a'
+    yield 'b'
+
+for x in generator():
+    print(x)
+```
+
+This compiles to
+```
+  0           0 RESUME                   0
+
+  1           2 LOAD_CONST               0 (<code object generator at 0x104cc34b0, file "guo_code/lecture_09.py", line 1>)
+              4 MAKE_FUNCTION
+              6 STORE_NAME               0 (generator)
+
+  5           8 PUSH_NULL
+             10 LOAD_NAME                0 (generator)
+             12 CALL                     0
+             20 GET_ITER
+        >>   22 FOR_ITER                11 (to 48)
+             26 STORE_NAME               1 (x)
+
+  6          28 PUSH_NULL
+             30 LOAD_NAME                2 (print)
+             32 LOAD_NAME                1 (x)
+             34 CALL                     1
+             42 POP_TOP
+             44 JUMP_BACKWARD           13 (to 22)
+
+  5     >>   48 END_FOR
+             50 RETURN_CONST             1 (None)
+
+Disassembly of <code object generator at 0x10561b4b0, file "guo_code/lecture_09.py", line 1>:
+  1           0 RETURN_GENERATOR
+              2 POP_TOP
+              4 RESUME                   0
+
+  2           6 LOAD_CONST               1 ('a')
+              8 YIELD_VALUE              1
+             10 RESUME                   1
+             12 POP_TOP
+
+  3          14 LOAD_CONST               2 ('b')
+             16 YIELD_VALUE              1
+             18 RESUME                   1
+             20 POP_TOP
+             22 RETURN_CONST             0 (None)
+        >>   24 CALL_INTRINSIC_1         3 (INTRINSIC_STOPITERATION_ERROR)
+             26 RERAISE                  1
+ExceptionTable:
+  4 to 22 -> 24 [0] lasti
+```
+
+The module-level code here should look familiar:
+- We call `generator` which is just a normal function call from the caller point of view
+- We call `GET_ITER` to convert the result to an iterator
+- We do a `FOR_ITER` loop that pushes each `next` result on the stack, looping back
+  until we get a `NULL` result in the C code and jump to the `END_FOR`.
+  
+  
+So our interest is entirely in the semantics of the generator itself. Let's actually
+si
+```
+def generator():
+    for s in "some big string":
+        yield s
+```
+which compiles to
+```
+  1           0 RETURN_GENERATOR
+              2 POP_TOP
+              4 RESUME                   0
+
+  2           6 LOAD_CONST               1 ('a')
+              8 YIELD_VALUE              1
+             10 RESUME                   1
+             12 POP_TOP
+
+  3          14 LOAD_CONST               2 ('b')
+             16 YIELD_VALUE              1
+             18 RESUME                   1
+             20 POP_TOP
+             22 RETURN_CONST             0 (None)
+        >>   24 CALL_INTRINSIC_1         3 (INTRINSIC_STOPITERATION_ERROR)
+             26 RERAISE                  1
+```
+
+The bytecodes we need ot understand here are
+- `RESUME`, which we've never actually looked at before although we've seen it at the start
+  of module top-levels. Here we have a `RESUME` at the top and also after each yield.
+- `YIELD_VALUE` which yields the top of the stack
+- The use of `POP_TOP` ... we'll skip that for now, it's related to coroutines where
+  the caller could inject data; we're popping an implicit `NONE` after each `RESUME`.
+- The `CALL_INTRINSIC_1` and `RERAISE`, which are injecting the equivalent of
+  an implicit `raise StopIteration`
+  
+  
+**RESUME**
+
+This opcode's actions:
+- Do a few sanity checks on the frame
+- Includes some instrumentation hooks that I don't need to understand yet
+- In most cases jumps to `handle_eval_breaker` giving us a chance to swap contexts
+  or do GC, etc
+- dispatches to the next instruction
+
+Note that the fact that RESUME is called on module top-levels means all these hooks
+also exist on import.
+
+
+**YIELD_VALUE**
+
+This opcode:
+- Grabs the top of the stack as the yield return value
+- grabs a `PyGenObject *gen` from `_PyFrame_GetGenerator(frame)`
+  - sets the state to suspended
+  - resets the stack pointer back one (so that the yielded value is no longer
+    on the stack when we resume)
+  - Does some more munging on both `gen` and `tstate`
+  - Calls `_Py_LeaveRecursiveCallPy(tstate)`
+  - Assigns the current `frame` to `gen_frame`
+  - Reassigns `frame` and `cframe.current_frame` to `frame->previous`
+  - Eliminates `gen_frame->previous`
+  - Calls `_PyFrame_StackPush(frame, retval`
+  - Calls `goto resume_frame`
+  
+What this effectively means is:
+- The frame's parent when we `yield` is always whoever is iterating over our
+  generator (we'll presumably see later when we look at the implementation of
+  `RETURN_GENERATOR` and the `tp_iter` of that how this is accomplished)
+- When we reassign `frame` and `gen_frame` we make both frames available, which
+  allows us to
+  - strip `retval` from the current `gen_frame` frame
+  - push `retval` to the parent `frame` which winds up accomplishing
+    what we'll need to populate the `FOR_ITER` stack push
+  - strip off the parent frame from `gen_frame` (because the next time we
+    call next on this iterator we might be somewhere else!)
+	
+	
+**RETURN_GENERATOR**
+
+This opcode implementation:
+
+- Accesses the current function from the frame, and creates a `PyGenObject`:
+  `PyGenObject *gen = (PyGenObject *)_Py_MakeCoro(func);`
+- Makes sure we've stored a lot of information in the current frame (which we
+  are about to abandon) so that when we resume we can get it back, and then
+  copies the frame into the `gen` object's `gi_iframe` field (because the
+  current `frame` is associated with the interpreter loop and is about to get
+  reassigned)
+- Does some stuff I don't yet understand related to frame `frame->frame_obj`
+- Calls `_Py_LeaveRecursiveCallPy(tstate)`
+- Pops the current frame, and resets the frame to the previous frame (this
+  jumps back to the caller), pushing the `gen` object onto the stack.
+  
+  
+**PyGenObject**
+
+
+The code for this lives in a few files:
+- The most used declarations are in `pycore_genobject.h`
+- The `PyGenObject` instance struct is defined, and the type object for it
+  is declared, in `Include/cpython/genobject.h` along with most of the
+  API functions.
+- The implementations of the functions and the type object live in
+  `genobject.c`
+
+The struct itself is a slightly more complex macro that uses prefix concatenation
+(via the `##` macro operator) to set a `gi_` prefix on all the fields.
+
+
+The `PyGen_Type` declaration in `genobject.c` is the best place to understand
+much of this logic, cross-referencing it against the bytecode implementations for
+`RETURN_GENERATOR`, `FOR_ITER`, `YIELD`, and `RESUME`:
+- It's a self-iterator type (`PyObject_SelfITER`)
+- The next `tp_iternext` points to `gen_iternext`, which proxies to
+  `gen_send_ex2` for most of the logic. This `gen_send_ex2` is where you can
+  see most of the magic.
+  
+This logic will require a bit of wading through; it's complicated by the
+presence of async; for historical reasons old-style generators, normal async
+awaitables / futures, and async generators are all somewhat muddled.
+
+I'll probably do well to study async logic (which Guo's lectures don't cover
+since Python2 didn't have async) before doing a full in-depth study of
+generators, since the ideas are similar but
+- async is more powerful, I think, since the event loop can switch in more
+  arbitrary ways than with generators
+- async is also more important to understand well as a python expert these
+  days
+  
+More modern resources probably cover this well; the Real Python blog post
+has a very quick intro here:
+https://realpython.com/cpython-source-code-guide/#a-review-of-the-generator-type
+  
+Another thing to eventually learn is the handling of `yield from`, which didn't
+exist in Python2 either.
+
+**Bonus: two-way generator coroutines**
+
+Note that the bytecode for two-way generator logic looks identical to normal
+"iterator-style" generator bytecode. The only difference is that you can use the
+result of `yield` instead of just popping it. In the *caller* you'll call the
+`send` function, which is bound in the `PyMethodDef` to `gen_send`.
+
+The implementation of `gen_send` relies on `gen_send_ex` which in turn relies
+on the same `gen_send_ex2` that we use in `gen_iternext`; the main difference
+is that we pass a non-null `arg` in the send case.
+
+
+There's also `throw` and `gen_throw`, which allows a caller to inject an exception
+into a generator frame.
