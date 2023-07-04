@@ -1002,3 +1002,212 @@ for example `Py_TPFLAGS_TYPE_SUBCLASS`.
 We'll see the bridge between user-defined classes with `__seq__`,
 `__iter__`, and/or `__next__` and the `tp_iter` / `tp_iternext` C
 APIs soon when we cover user-defined classes.
+
+
+## Lecture 8: User-defined classes
+
+See https://www.youtube.com/watch?v=Wbu2wMCcTKo&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=8
+
+### A range-like example
+
+Inspired by the previous iterator lecture, let's consider a pure-Python
+counter iterator:
+```py
+class IterateForever:
+    def __init__(self, x_arg):
+        self.x = x_arg
+
+    def __next__(self):
+        return self.x
+
+iterate_forever = IterateForever(42)class IterateForever:
+```
+
+How does this all work?
+
+It could be useful to visualize the execution at
+https://pythontutor.com/render.html#mode=display.
+
+Now let's look at the for just the class:
+```
+  0           0 RESUME                   0
+  1           2 PUSH_NULL
+              4 LOAD_BUILD_CLASS
+              6 LOAD_CONST               0 (<code object IterateForever at 0x101613590, file "guo_code/lecture_08_a.py", line 1>)
+              8 MAKE_FUNCTION
+             10 LOAD_CONST               1 ('IterateForever')
+             12 CALL                     2
+             20 STORE_NAME               0 (IterateForever)
+
+  8          22 PUSH_NULL
+             24 LOAD_NAME                0 (IterateForever)
+             26 LOAD_CONST               2 (42)
+             28 CALL                     1
+             36 STORE_NAME               1 (iterate_forever)
+             38 RETURN_CONST             3 (None)
+
+Disassembly of <code object IterateForever at 0x101613590, file "guo_code/lecture_08_a.py", line 1>:
+  1           0 RESUME                   0
+              2 LOAD_NAME                0 (__name__)
+              4 STORE_NAME               1 (__module__)
+              6 LOAD_CONST               0 ('IterateForever')
+              8 STORE_NAME               2 (__qualname__)
+
+  2          10 LOAD_CONST               1 (<code object __init__ at 0x101613ad0, file "guo_code/lecture_08_a.py", line 2>)
+             12 MAKE_FUNCTION
+             14 STORE_NAME               3 (__init__)
+
+  5          16 LOAD_CONST               2 (<code object __next__ at 0x1015474b0, file "guo_code/lecture_08_a.py", line 5>)
+             18 MAKE_FUNCTION
+             20 STORE_NAME               4 (__next__)
+             22 RETURN_CONST             3 (None)
+
+Disassembly of <code object __init__ at 0x101613ad0, file "guo_code/lecture_08_a.py", line 2>:
+  2           0 RESUME                   0
+
+  3           2 LOAD_FAST_LOAD_FAST     16 (x_arg, self)
+              4 STORE_ATTR               0 (x)
+             14 RETURN_CONST             0 (None)
+
+Disassembly of <code object __next__ at 0x1015474b0, file "guo_code/lecture_08_a.py", line 5>:
+  5           0 RESUME                   0
+
+  6           2 LOAD_FAST                0 (self)
+              4 LOAD_ATTR                0 (x)
+             24 RETURN_VALUE
+```
+
+Most of this is just the same kinds of function code we've seen before
+with a few new opcodes not tied to this lecture like
+- `SWAP`, which just flips stack entries
+- `LOAD_FAST_LOAD_FAST` which just combines two `LOAD_FAST`s
+- `POP_JUMP_IF_FALSE` which is straightforward
+- `RAISE_VARARGS 1` which raises an error of the type at the
+  top of the stack (note the `LOAD_GLOBAL StopIteration` above it)
+
+The key new OOP opcodes we want to focus on are:
+- The code for the top-level (`code object CustomRange at 0x101796c40`)
+- The new `LOAD_BUILD_CLASS`opcode
+- The code for the methods, mainly the bit about `self`
+- The new `LOAD_ATTR` opcode
+- The new `STORE_ATTR` opcode
+
+The class construction, which goes beyond one opcode, is of particular interest.
+
+### Creating a class: how the bytecode works
+
+Observe that the class body has compiled code:
+```
+Disassembly of <code object IterateForever at 0x101613590, file "guo_code/lecture_08_a.py", line 1>:
+  1           0 RESUME                   0
+              2 LOAD_NAME                0 (__name__)
+              4 STORE_NAME               1 (__module__)
+              6 LOAD_CONST               0 ('IterateForever')
+              8 STORE_NAME               2 (__qualname__)
+
+  2          10 LOAD_CONST               1 (<code object __init__ at 0x101613ad0, file "guo_code/lecture_08_a.py", line 2>)
+             12 MAKE_FUNCTION
+             14 STORE_NAME               3 (__init__)
+
+  5          16 LOAD_CONST               2 (<code object __next__ at 0x1015474b0, file "guo_code/lecture_08_a.py", line 5>)
+             18 MAKE_FUNCTION
+             20 STORE_NAME               4 (__next__)
+             22 RETURN_CONST             3 (None)
+```
+
+This code can define any locals it wants; they wind up being
+interpreted by the `__new__` function of the metaclass (which by
+default is `type`). In many typical examples, it will do nothing
+but define functions, which become methods of the class.
+
+How is this called from the module top-level?
+```
+  1           2 PUSH_NULL
+              4 LOAD_BUILD_CLASS
+              6 LOAD_CONST               0 (<code object IterateForever at 0x101613590, file "guo_code/lecture_08_a.py", line 1>)
+              8 MAKE_FUNCTION
+             10 LOAD_CONST               1 ('IterateForever')
+             12 CALL                     2
+             20 STORE_NAME               0 (IterateForever)
+```
+
+The `LOAD_BUILD_CLASS` opcode is really just loading `builtins.__build_class__`,
+which you can poke at from Python:
+```
+>>> __build_class__
+<built-in function __build_class__>
+```
+
+Then, it
+- pushes the code object for the classI
+- calls `MAKE_FUNCTION` to create a `PyFunctionObject` for the top-level
+- pushes the class name
+- executes a `CALL` with 2 args; the args are the class body function and the name
+
+This means we're effectively running `__build_class__(top_level, 'IterateForever')`
+
+I beleive the `PUSH_NULL` is because the call can potentially take kwargs for
+inheritance; we aren't using that here.
+
+### Creating a class: what is the `__build_class__` function?
+
+The `__build_class__` function is defined in `Python/bltinmodules.c`, which defines
+builtins; the implementation lives at `builtin___build_class__` and it is bound
+to the module in the `PyMethodDef` near the bottom.
+
+What it does (with a ton of error handling) is:
+- Check that the function passed is callable
+- Extract the class name (args[1])
+- Extract base class names (other args; this is a varargs function)
+- Figure out the metaclass
+  - Calculate it if kwargs were passed; this is pretty involved, and
+    eventually calls `_PyType_CalculateMetaclass`
+  - Otherwise, use `PyType_Type` (i.e. `builtins.type`) as the metaclass
+- Do some stuff to build a namespace `ns` in which to evaluate our
+  function. I'm not sure how this works yet, but I'm pretty sure that
+  it's basically how the locals get back out.
+- Check for `__prepare__`; not sure what this does
+- Do some magic that I can't yet understand...
+  - Evaluate `func` with the namespace `ns`; I'm not yet sure how it all
+    works but basically this will extract the dict of locals.
+  - Call `meta` on the `ns`, which actually constructs the class, as `cls`
+  - Do some sanity checks that I don't really understand yet
+  - If all goes well, return the `cls`
+  
+There's still quite a lot I don't understand, but these notes are a decent start
+for a deep-dive.
+
+### Poking a little at the code kicked off by `__build_class__`
+
+The type object code lives in
+- `Internal/pyrcore_typeobject.h` for the core header declarations.
+- `Objects/typeobject.c` (which also generates the clinic header at
+  `typeobject.c.h` based on comments) for the definitions.
+  
+I got a little lost trying to skim this code, it's *huge* but this
+is where all the slot construction happens.
+
+`PyClassObject` is defined in `classobject.h` and `classobject.c`,
+and the ultimate output is going to be one of these.
+
+... Okay to be honest at this point I'm pretty lost on everything, the
+OOP code is vastly more complex and verbose than other things we've
+looked at so far...
+
+But one other big takeaway is that eventually function calls will
+fall through to `_PyObject_Call`, which looks up `tp_call`, and
+the class objects that result from `__build_class__` calls are
+callable, with a `tp_call` that ultimately calls the metaclass
+`__new__` and then `__init__`.
+
+Infortunately the lecture is mostly not helpful in navigating this;
+more than previous lectures it has been outdated, `PyInstance_New`
+no longer even exists and the code is too verbose for me to easily
+back into what replaced it.
+
+Even back then the code was complex - this is the only lecture where
+Guo spends a good chunk of the lecture lost heh. One thing to keep in
+mind when skimming the C code is that the logic is still object
+oriented: if you invoke a method on an object, you don't actually need
+to pass the object becasue the method already has a handle for `self`.
+This was part of how he got confused.
