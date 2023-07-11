@@ -1214,7 +1214,7 @@ This was part of how he got confused.
 
 ## Lecture 9: Generators
 
-See
+See https://www.youtube.com/watch?v=wwjqMIlOuOo&list=PLzV58Zm8FuBL6OAv1Yu6AwXZrnsFbbR0S&index=9
 
 ### An example
 
